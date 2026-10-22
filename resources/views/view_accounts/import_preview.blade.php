@@ -6,19 +6,11 @@
 @section('content')
 <div class="card-surface" style="padding: 0; overflow: hidden;">
     <div style="padding: 20px 20px 0;">
-        <p style="margin: 0 0 8px;">{{ $readyCount }} {{ $readyCount === 1 ? 'account is' : 'accounts are' }} ready to import. {{ $skippedCount }} {{ $skippedCount === 1 ? 'row will be skipped' : 'rows will be skipped' }}.</p>
-        @if($skippedCount > 0)
-            <ul style="margin: 0; padding-left: 18px; color: var(--danger); font-size: 0.9rem;">
-                @foreach($data as $row)
-                    @if($row['errors'])
-                        <li>Row {{ $row['line'] }} ({{ $row['fname'] }} {{ $row['lname'] }}, {{ $row['email'] }}): {{ implode(', ', $row['errors']) }}</li>
-                    @endif
-                @endforeach
-            </ul>
-        @endif
+        <p style="margin: 0;">{{ $readyCount }} {{ $readyCount === 1 ? 'account is' : 'accounts are' }} ready to import. {{ $skippedCount }} {{ $skippedCount === 1 ? 'row will be skipped' : 'rows will be skipped' }}.</p>
     </div>
     <form action="{{ route('users.import.confirm') }}" method="POST">
         @csrf
+        <input type="hidden" name="import_id" value="{{ $importId }}">
         <div class="table-wrap" style="border: none;">
             <table class="table-app">
                 <thead>

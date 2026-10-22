@@ -3,8 +3,8 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\User;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -117,10 +117,14 @@ class UserController extends Controller
         }
 
         $data = $this->flagExistingEmails($parsed['rows']);
-        $this->storeImportRows($data);
+        $importId = $this->storeImportRows($data);
+        if ($importId === null) {
+            return redirect()->route('users.index')->with('error', 'The import could not be saved. Upload the file again.');
+        }
 
         return view('view_accounts.import_preview', [
             'data' => $data,
+            'importId' => $importId,
             'readyCount' => count(array_filter($data, fn ($row) => empty($row['errors']))),
             'skippedCount' => count(array_filter($data, fn ($row) => ! empty($row['errors']))),
         ]);
@@ -128,9 +132,9 @@ class UserController extends Controller
 
     public function importConfirm(Request $request)
     {
-        $data = $this->pullStoredImportRows();
+        $data = $this->pullStoredImportRows($request->input('import_id'));
         if ($data === null) {
-            return redirect()->route('users.index')->with('error', 'That import expired. Upload the file again.');
+            return redirect()->route('users.index')->with('error', 'The import preview was not saved. Upload the file again.');
         }
 
         $result = $this->insertImportRows($this->flagExistingEmails($data));
@@ -261,7 +265,7 @@ class UserController extends Controller
                     return '';
                 }
 
-                return trim((string) ($csv[$map[$field]] ?? ''));
+                return $this->toUtf8(trim((string) ($csv[$map[$field]] ?? '')));
             };
 
             $lname = $value('lname');
@@ -358,37 +362,55 @@ class UserController extends Controller
         return $rows;
     }
 
+    private function toUtf8(string $value): string
+    {
+        if ($value === '' || mb_check_encoding($value, 'UTF-8')) {
+            return $value;
+        }
+
+        $converted = mb_convert_encoding($value, 'UTF-8', 'Windows-1252');
+
+        return is_string($converted) ? $converted : $value;
+    }
+
     /**
      * @param  array<int, array<string, mixed>>  $rows
      */
-    private function storeImportRows(array $rows): void
+    private function storeImportRows(array $rows): ?string
     {
         $this->deleteStoredImport();
 
         $id = (string) Str::uuid();
-        Storage::disk('local')->put($this->importStoragePath($id), json_encode($rows));
+
+        try {
+            Cache::put($this->importCacheKey($id), $rows, now()->addHours(2));
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if (! is_array(Cache::get($this->importCacheKey($id)))) {
+            Cache::forget($this->importCacheKey($id));
+
+            return null;
+        }
+
         session(['user_import_id' => $id]);
+
+        return $id;
     }
 
     /**
      * @return array<int, array<string, mixed>>|null
      */
-    private function pullStoredImportRows(): ?array
+    private function pullStoredImportRows(?string $postedId): ?array
     {
-        $id = session('user_import_id');
+        $id = is_string($postedId) && $postedId !== '' ? $postedId : session('user_import_id');
         if (! is_string($id) || ! preg_match('/^[0-9a-fA-F-]{36}$/', $id)) {
             return null;
         }
 
-        $path = $this->importStoragePath($id);
-        if (! Storage::disk('local')->exists($path)) {
-            session()->forget('user_import_id');
-
-            return null;
-        }
-
-        $rows = json_decode(Storage::disk('local')->get($path), true);
-        $this->deleteStoredImport();
+        $rows = Cache::pull($this->importCacheKey($id));
+        session()->forget('user_import_id');
 
         return is_array($rows) ? $rows : null;
     }
@@ -397,15 +419,15 @@ class UserController extends Controller
     {
         $id = session('user_import_id');
         if (is_string($id) && preg_match('/^[0-9a-fA-F-]{36}$/', $id)) {
-            Storage::disk('local')->delete($this->importStoragePath($id));
+            Cache::forget($this->importCacheKey($id));
         }
 
         session()->forget('user_import_id');
     }
 
-    private function importStoragePath(string $id): string
+    private function importCacheKey(string $id): string
     {
-        return "user-imports/{$id}.json";
+        return 'user-import:'.auth()->id().':'.$id;
     }
 
     /**
