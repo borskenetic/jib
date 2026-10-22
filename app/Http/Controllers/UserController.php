@@ -4,6 +4,8 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -93,76 +95,14 @@ class UserController extends Controller
             'file' => 'required|mimes:csv,txt'
         ]);
 
-        $file = fopen($request->file('file'), 'r');
-
-        $rowNumber = 0;
-        $errors = [];
-        $successCount = 0;
-
-        while (($row = fgetcsv($file)) !== FALSE) {
-            $rowNumber++;
-
-            if ($rowNumber == 1) continue;
-
-            $lname = trim($row[0] ?? '');
-            $fname = trim($row[1] ?? '');
-            $email = trim($row[2] ?? '');
-            $password = trim($row[3] ?? '');
-            $role = strtolower(trim($row[4] ?? ''));
-            $campus = trim($row[5] ?? '');
-            $department = trim($row[6] ?? '');
-            $course = trim($row[7] ?? '');
-
-            if (!$lname || !$fname || !$email || !$password || !$role || !$campus) {
-                $errors[] = "Row $rowNumber: Missing fields.";
-                continue;
-            }
-
-            if (!str_ends_with($email, '@jib.edu.ph')) {
-                $errors[] = "Row $rowNumber: Invalid email ($email). Must be @jib.edu.ph";
-                continue;
-            }
-
-            if (User::where('email', $email)->exists()) {
-                $errors[] = "Row $rowNumber: Email already exists ($email)";
-                continue;
-            }
-
-            if (!in_array($role, $this->allowedRoles(), true)) {
-                $errors[] = "Row $rowNumber: Invalid role ($role).";
-                continue;
-            }
-
-            if ($role === 'student' && $course === '') {
-                $errors[] = "Row $rowNumber: Course is required for students.";
-                continue;
-            }
-
-            try {
-                User::create([
-                    'lname' => $lname,
-                    'fname' => $fname,
-                    'email' => $email,
-                    'password' => Hash::make($password, ['rounds' => 12]),
-                    'role' => $role,
-                    'campus' => $campus,
-                    'department' => $department ?: null,
-                    'course' => $role === 'student' ? $course : null,
-                ]);
-
-                $successCount++;
-
-            } catch (\Exception $e) {
-                $errors[] = "Row $rowNumber: Failed to insert.";
-            }
+        $parsed = $this->parseUserImportCsv($request->file('file')->getRealPath());
+        if ($parsed['error']) {
+            return redirect()->route('users.index')->with('error', $parsed['error']);
         }
 
-        fclose($file);
+        $result = $this->insertImportRows($this->flagExistingEmails($parsed['rows']));
 
-        return redirect()->route('users.index')->with([
-            'success' => "$successCount users imported successfully.",
-            'import_errors' => $errors
-        ]);
+        return redirect()->route('users.index')->with($this->importFlash($result));
     }
 
     public function importPreview(Request $request)
@@ -171,52 +111,173 @@ class UserController extends Controller
             'file' => 'required|mimes:csv,txt'
         ]);
 
-        $file = fopen($request->file('file'), 'r');
+        $parsed = $this->parseUserImportCsv($request->file('file')->getRealPath());
+        if ($parsed['error']) {
+            return redirect()->route('users.index')->with('error', $parsed['error']);
+        }
 
-        $data = [];
-        $rowNumber = 0;
+        $data = $this->flagExistingEmails($parsed['rows']);
+        $this->storeImportRows($data);
 
-        while (($row = fgetcsv($file)) !== FALSE) {
-            $rowNumber++;
+        return view('view_accounts.import_preview', [
+            'data' => $data,
+            'readyCount' => count(array_filter($data, fn ($row) => empty($row['errors']))),
+            'skippedCount' => count(array_filter($data, fn ($row) => ! empty($row['errors']))),
+        ]);
+    }
 
-            if ($rowNumber == 1) continue;
+    public function importConfirm(Request $request)
+    {
+        $data = $this->pullStoredImportRows();
+        if ($data === null) {
+            return redirect()->route('users.index')->with('error', 'That import expired. Upload the file again.');
+        }
 
-            if (empty(array_filter($row))) {
+        $result = $this->insertImportRows($this->flagExistingEmails($data));
+
+        return redirect()->route('users.index')->with($this->importFlash($result));
+    }
+
+    private function importFlash(array $result): array
+    {
+        $inserted = $result['inserted'];
+        $skipped = count($result['errors']);
+        $message = $inserted === 1
+            ? '1 user imported successfully.'
+            : "$inserted users imported successfully.";
+
+        if ($skipped > 0) {
+            $message .= $skipped === 1
+                ? ' 1 row was skipped.'
+                : " $skipped rows were skipped.";
+        }
+
+        $flash = ['success' => $message];
+        if ($skipped > 0) {
+            $flash['import_errors'] = $result['errors'];
+        }
+
+        return $flash;
+    }
+
+    /**
+     * Read a user CSV by header name. Course and department may be blank.
+     * Columns are matched by header, so a file without a department column
+     * still keeps the course value in the course field.
+     *
+     * @return array{error: ?string, rows: array<int, array<string, mixed>>}
+     */
+    private function parseUserImportCsv(string $path): array
+    {
+        $handle = fopen($path, 'r');
+        if ($handle === false) {
+            return ['error' => 'Could not read the uploaded file.', 'rows' => []];
+        }
+
+        $header = fgetcsv($handle);
+        if ($header === false || $header === [null]) {
+            fclose($handle);
+
+            return ['error' => 'The file is empty.', 'rows' => []];
+        }
+
+        $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string) $header[0]);
+
+        $aliases = [
+            'lname' => 'lname',
+            'last_name' => 'lname',
+            'lastname' => 'lname',
+            'fname' => 'fname',
+            'first_name' => 'fname',
+            'firstname' => 'fname',
+            'email' => 'email',
+            'password' => 'password',
+            'role' => 'role',
+            'campus' => 'campus',
+            'department' => 'department',
+            'course' => 'course',
+        ];
+
+        $map = [];
+        foreach ($header as $index => $name) {
+            $key = strtolower(trim((string) $name));
+            $key = preg_replace('/[\s\-]+/', '_', $key) ?? $key;
+            if (isset($aliases[$key]) && ! isset($map[$aliases[$key]])) {
+                $map[$aliases[$key]] = $index;
+            }
+        }
+
+        $missing = array_values(array_diff(
+            ['lname', 'fname', 'email', 'password', 'role', 'campus'],
+            array_keys($map)
+        ));
+
+        if ($missing !== []) {
+            fclose($handle);
+
+            return [
+                'error' => 'Missing required column: '.implode(', ', $missing).'. Expected headers are lname, fname, email, password, role, and campus. Course and department are optional.',
+                'rows' => [],
+            ];
+        }
+
+        $rows = [];
+        $seenEmails = [];
+        $line = 1;
+
+        while (($csv = fgetcsv($handle)) !== false) {
+            $line++;
+
+            if ($csv === [null] || ! array_filter($csv, fn ($value) => trim((string) $value) !== '')) {
                 continue;
             }
 
-            $lname = trim($row[0] ?? '');
-            $fname = trim($row[1] ?? '');
-            $email = trim($row[2] ?? '');
-            $password = trim($row[3] ?? '');
-            $role = strtolower(trim($row[4] ?? ''));
-            $campus = trim($row[5] ?? '');
-            $department = trim($row[6] ?? '');
-            $course = trim($row[7] ?? '');
+            $value = function (string $field) use ($csv, $map): string {
+                if (! isset($map[$field])) {
+                    return '';
+                }
 
+                return trim((string) ($csv[$map[$field]] ?? ''));
+            };
+
+            $lname = $value('lname');
+            $fname = $value('fname');
+            $email = $value('email');
+            $password = $value('password');
+            $role = strtolower($value('role'));
+            $campus = $value('campus');
+            $department = $value('department');
+            $course = $value('course');
             $errors = [];
 
-            if (!$lname || !$fname || !$email || !$password || !$role || !$campus) {
+            if ($lname === '' || $fname === '' || $email === '' || $password === '' || $role === '' || $campus === '') {
                 $errors[] = 'Missing required fields';
             }
 
-            if ($email && !str_ends_with($email, '@jib.edu.ph')) {
+            if ($email !== '' && ! str_ends_with(strtolower($email), '@jib.edu.ph')) {
                 $errors[] = 'Invalid domain';
             }
 
-            if ($email && User::where('email', $email)->exists()) {
-                $errors[] = 'Duplicate email';
-            }
-
-            if ($role && !in_array($role, $this->allowedRoles(), true)) {
+            if ($role !== '' && ! in_array($role, $this->allowedRoles(), true)) {
                 $errors[] = 'Invalid role';
             }
 
-            if ($role === 'student' && !$course) {
-                $errors[] = 'Course required for students';
+            $emailKey = strtolower($email);
+            if ($emailKey !== '') {
+                if (isset($seenEmails[$emailKey])) {
+                    $first = $seenEmails[$emailKey];
+                    $errors[] = "Duplicate email in this file (row {$first['line']}: {$first['fname']} {$first['lname']})";
+                } else {
+                    $seenEmails[$emailKey] = [
+                        'line' => $line,
+                        'fname' => $fname,
+                        'lname' => $lname,
+                    ];
+                }
             }
 
-            $data[] = [
+            $rows[] = [
+                'line' => $line,
                 'lname' => $lname,
                 'fname' => $fname,
                 'email' => $email,
@@ -225,46 +286,155 @@ class UserController extends Controller
                 'campus' => $campus,
                 'department' => $department,
                 'course' => $course,
-                'errors' => $errors
+                'errors' => $errors,
             ];
         }
 
-        fclose($file);
+        fclose($handle);
 
-        return view('view_accounts.import_preview', compact('data'));
+        return ['error' => null, 'rows' => $rows];
     }
 
-    public function importConfirm(Request $request)
+    /**
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private function flagExistingEmails(array $rows): array
     {
-        $data = $request->input('data', []);
-
-        $successCount = 0;
-
-        foreach ($data as $row) {
-            $rowErrors = $row['errors'] ?? [];
-            if (is_string($rowErrors)) {
-                $rowErrors = $rowErrors === '' ? [] : explode('|', $rowErrors);
+        $emails = [];
+        foreach ($rows as $row) {
+            if (($row['email'] ?? '') !== '') {
+                $emails[] = $row['email'];
             }
-            if (!empty($rowErrors)) {
+        }
+
+        if ($emails === []) {
+            return $rows;
+        }
+
+        $existing = User::query()
+            ->whereIn('email', $emails)
+            ->pluck('email')
+            ->map(fn ($email) => strtolower($email))
+            ->flip();
+
+        foreach ($rows as &$row) {
+            $emailKey = strtolower((string) ($row['email'] ?? ''));
+            if ($emailKey === '' || ! isset($existing[$emailKey])) {
                 continue;
             }
 
-            User::create([
-                'lname' => $row['lname'],
-                'fname' => $row['fname'],
-                'email' => $row['email'],
-                'campus' => $row['campus'] ?? null,
-                'department' => $row['department'] ?? null,
-                'course' => $row['role'] === 'student' ? ($row['course'] ?? null) : null,
-                'password' => Hash::make($row['password'], ['rounds' => 12]),
-                'role' => $row['role']
-            ]);
+            $row['errors'] = array_values($row['errors'] ?? []);
+            if (! in_array('Email already exists', $row['errors'], true)) {
+                $row['errors'][] = 'Email already exists';
+            }
+        }
+        unset($row);
 
-            $successCount++;
+        return $rows;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $rows
+     */
+    private function storeImportRows(array $rows): void
+    {
+        $this->deleteStoredImport();
+
+        $id = (string) Str::uuid();
+        Storage::disk('local')->put($this->importStoragePath($id), json_encode($rows));
+        session(['user_import_id' => $id]);
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>|null
+     */
+    private function pullStoredImportRows(): ?array
+    {
+        $id = session('user_import_id');
+        if (! is_string($id) || ! preg_match('/^[0-9a-fA-F-]{36}$/', $id)) {
+            return null;
         }
 
-        return redirect()->route('users.index')
-            ->with('success', "$successCount users imported successfully.");
+        $path = $this->importStoragePath($id);
+        if (! Storage::disk('local')->exists($path)) {
+            session()->forget('user_import_id');
+
+            return null;
+        }
+
+        $rows = json_decode(Storage::disk('local')->get($path), true);
+        $this->deleteStoredImport();
+
+        return is_array($rows) ? $rows : null;
+    }
+
+    private function deleteStoredImport(): void
+    {
+        $id = session('user_import_id');
+        if (is_string($id) && preg_match('/^[0-9a-fA-F-]{36}$/', $id)) {
+            Storage::disk('local')->delete($this->importStoragePath($id));
+        }
+
+        session()->forget('user_import_id');
+    }
+
+    private function importStoragePath(string $id): string
+    {
+        return "user-imports/{$id}.json";
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array{inserted: int, errors: array<int, string>}
+     */
+    private function insertImportRows(array $rows): array
+    {
+        @set_time_limit(0);
+
+        $inserted = 0;
+        $errors = [];
+        $seen = [];
+
+        foreach ($rows as $row) {
+            $line = $row['line'] ?? '?';
+            $email = (string) ($row['email'] ?? '');
+            $rowErrors = array_values(array_filter($row['errors'] ?? []));
+
+            if ($rowErrors !== []) {
+                $errors[] = "Row {$line}: ".implode(', ', $rowErrors).($email !== '' ? " ({$email})" : '');
+                continue;
+            }
+
+            $emailKey = strtolower($email);
+            if (isset($seen[$emailKey])) {
+                $errors[] = "Row {$line}: Email already exists ({$email})";
+                continue;
+            }
+
+            try {
+                User::create([
+                    'lname' => $row['lname'],
+                    'fname' => $row['fname'],
+                    'email' => $email,
+                    'campus' => $row['campus'] ?: null,
+                    'department' => ($row['department'] ?? '') !== '' ? $row['department'] : null,
+                    'course' => ($row['course'] ?? '') !== '' ? $row['course'] : null,
+                    'password' => Hash::make($row['password']),
+                    'role' => $row['role'],
+                ]);
+
+                $seen[$emailKey] = true;
+                $inserted++;
+            } catch (\Throwable $e) {
+                $errors[] = "Row {$line}: Failed to insert ({$email}).";
+            }
+        }
+
+        return [
+            'inserted' => $inserted,
+            'errors' => $errors,
+        ];
     }
 
     public function store(Request $request)
