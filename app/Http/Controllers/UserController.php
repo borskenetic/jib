@@ -160,6 +160,20 @@ class UserController extends Controller
         return $flash;
     }
 
+    private function detectCsvDelimiter(string $line): string
+    {
+        $line = preg_replace('/^\xEF\xBB\xBF/', '', $line) ?? $line;
+        $counts = [
+            "\t" => substr_count($line, "\t"),
+            ';' => substr_count($line, ';'),
+            ',' => substr_count($line, ','),
+        ];
+        arsort($counts);
+        $delimiter = array_key_first($counts);
+
+        return ($counts[$delimiter] ?? 0) > 0 ? $delimiter : ',';
+    }
+
     /**
      * Read a user CSV by header name. Course and department may be blank.
      * Columns are matched by header, so a file without a department column
@@ -174,7 +188,17 @@ class UserController extends Controller
             return ['error' => 'Could not read the uploaded file.', 'rows' => []];
         }
 
-        $header = fgetcsv($handle);
+        $sample = fgets($handle);
+        if ($sample === false) {
+            fclose($handle);
+
+            return ['error' => 'The file is empty.', 'rows' => []];
+        }
+
+        rewind($handle);
+        $delimiter = $this->detectCsvDelimiter($sample);
+
+        $header = fgetcsv($handle, null, $delimiter);
         if ($header === false || $header === [null]) {
             fclose($handle);
 
@@ -225,7 +249,7 @@ class UserController extends Controller
         $seenEmails = [];
         $line = 1;
 
-        while (($csv = fgetcsv($handle)) !== false) {
+        while (($csv = fgetcsv($handle, null, $delimiter)) !== false) {
             $line++;
 
             if ($csv === [null] || ! array_filter($csv, fn ($value) => trim((string) $value) !== '')) {
