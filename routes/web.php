@@ -256,4 +256,5 @@ Route::middleware(['auth', 'can:isAdmin'])->group(function () {
     
     Route::post('/users/import/preview', [UserController::class, 'importPreview'])->name('users.import.preview');
     Route::post('/users/import/confirm', [UserController::class, 'importConfirm'])->name('users.import.confirm');
+    Route::post('/users/import/batch', [UserController::class, 'importBatch'])->name('users.import.batch');
 });

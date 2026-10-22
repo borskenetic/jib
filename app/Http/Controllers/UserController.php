@@ -100,9 +100,12 @@ class UserController extends Controller
             return redirect()->route('users.index')->with('error', $parsed['error']);
         }
 
-        $result = $this->insertImportRows($this->flagExistingEmails($parsed['rows']));
+        $importId = $this->storeImportRows($this->flagExistingEmails($parsed['rows']));
+        if ($importId === null) {
+            return redirect()->route('users.index')->with('error', 'The import could not be saved. Upload the file again.');
+        }
 
-        return redirect()->route('users.index')->with($this->importFlash($result));
+        return $this->runImportBatch($importId);
     }
 
     public function importPreview(Request $request)
@@ -132,14 +135,15 @@ class UserController extends Controller
 
     public function importConfirm(Request $request)
     {
-        $data = $this->pullStoredImportRows($request->input('import_id'));
-        if ($data === null) {
-            return redirect()->route('users.index')->with('error', 'The import preview was not saved. Upload the file again.');
-        }
+        return $this->importBatch($request);
+    }
 
-        $result = $this->insertImportRows($this->flagExistingEmails($data));
+    public function importBatch(Request $request)
+    {
+        $postedId = $request->input('import_id');
+        $id = is_string($postedId) && $postedId !== '' ? $postedId : session('user_import_id');
 
-        return redirect()->route('users.index')->with($this->importFlash($result));
+        return $this->runImportBatch(is_string($id) ? $id : null);
     }
 
     private function importFlash(array $result): array
@@ -381,14 +385,22 @@ class UserController extends Controller
         $this->deleteStoredImport();
 
         $id = (string) Str::uuid();
+        $state = [
+            'rows' => $rows,
+            'cursor' => 0,
+            'inserted' => 0,
+            'errors' => [],
+            'seen' => [],
+        ];
 
         try {
-            Cache::put($this->importCacheKey($id), $rows, now()->addHours(2));
+            Cache::put($this->importCacheKey($id), $state, now()->addHours(2));
         } catch (\Throwable $e) {
             return null;
         }
 
-        if (! is_array(Cache::get($this->importCacheKey($id)))) {
+        $stored = Cache::get($this->importCacheKey($id));
+        if (! is_array($stored) || ! isset($stored['rows']) || ! is_array($stored['rows'])) {
             Cache::forget($this->importCacheKey($id));
 
             return null;
@@ -397,22 +409,6 @@ class UserController extends Controller
         session(['user_import_id' => $id]);
 
         return $id;
-    }
-
-    /**
-     * @return array<int, array<string, mixed>>|null
-     */
-    private function pullStoredImportRows(?string $postedId): ?array
-    {
-        $id = is_string($postedId) && $postedId !== '' ? $postedId : session('user_import_id');
-        if (! is_string($id) || ! preg_match('/^[0-9a-fA-F-]{36}$/', $id)) {
-            return null;
-        }
-
-        $rows = Cache::pull($this->importCacheKey($id));
-        session()->forget('user_import_id');
-
-        return is_array($rows) ? $rows : null;
     }
 
     private function deleteStoredImport(): void
@@ -430,19 +426,74 @@ class UserController extends Controller
         return 'user-import:'.auth()->id().':'.$id;
     }
 
-    /**
-     * @param  array<int, array<string, mixed>>  $rows
-     * @return array{inserted: int, errors: array<int, string>}
-     */
-    private function insertImportRows(array $rows): array
+    private function runImportBatch(?string $id)
     {
-        @set_time_limit(0);
+        if (! is_string($id) || ! preg_match('/^[0-9a-fA-F-]{36}$/', $id)) {
+            return redirect()->route('users.index')->with('error', 'The import preview was not saved. Upload the file again.');
+        }
 
-        $inserted = 0;
-        $errors = [];
-        $seen = [];
+        $lock = null;
+        try {
+            $lock = Cache::lock($this->importCacheKey($id).':lock', 20);
+            $acquired = $lock->get();
+        } catch (\Throwable $e) {
+            $lock = null;
+            $acquired = true;
+        }
 
-        foreach ($rows as $row) {
+        if (! $acquired) {
+            return view('view_accounts.import_progress', [
+                'importId' => $id,
+                'processed' => null,
+                'total' => null,
+                'inserted' => null,
+                'waiting' => true,
+            ]);
+        }
+
+        try {
+            return $this->advanceImportBatch($id);
+        } finally {
+            $lock?->release();
+        }
+    }
+
+    private function advanceImportBatch(string $id)
+    {
+        @set_time_limit(60);
+
+        $state = Cache::get($this->importCacheKey($id));
+        if (is_array($state) && isset($state[0]['email'])) {
+            $state = [
+                'rows' => $state,
+                'cursor' => 0,
+                'inserted' => 0,
+                'errors' => [],
+                'seen' => [],
+            ];
+        }
+
+        if (! is_array($state) || ! isset($state['rows']) || ! is_array($state['rows'])) {
+            return redirect()->route('users.index')->with('error', 'The import preview was not saved. Upload the file again.');
+        }
+
+        $rows = $state['rows'];
+        $total = count($rows);
+        $cursor = (int) ($state['cursor'] ?? 0);
+        $inserted = (int) ($state['inserted'] ?? 0);
+        $errors = array_values($state['errors'] ?? []);
+        $seen = is_array($state['seen'] ?? null) ? $state['seen'] : [];
+        $insertsThisRequest = 0;
+        $deadline = microtime(true) + 12;
+
+        while ($cursor < $total) {
+            if ($insertsThisRequest > 0 && (microtime(true) >= $deadline || $insertsThisRequest >= 40)) {
+                break;
+            }
+
+            $row = $rows[$cursor];
+            $cursor++;
+
             $line = $row['line'] ?? '?';
             $email = (string) ($row['email'] ?? '');
             $rowErrors = array_values(array_filter($row['errors'] ?? []));
@@ -453,8 +504,9 @@ class UserController extends Controller
             }
 
             $emailKey = strtolower($email);
-            if (isset($seen[$emailKey])) {
+            if ($emailKey === '' || isset($seen[$emailKey]) || User::where('email', $email)->exists()) {
                 $errors[] = "Row {$line}: Email already exists ({$email})";
+                $seen[$emailKey] = true;
                 continue;
             }
 
@@ -472,15 +524,37 @@ class UserController extends Controller
 
                 $seen[$emailKey] = true;
                 $inserted++;
+                $insertsThisRequest++;
             } catch (\Throwable $e) {
                 $errors[] = "Row {$line}: Failed to insert ({$email}).";
             }
         }
 
-        return [
+        if ($cursor >= $total) {
+            Cache::forget($this->importCacheKey($id));
+            session()->forget('user_import_id');
+
+            return redirect()->route('users.index')->with($this->importFlash([
+                'inserted' => $inserted,
+                'errors' => $errors,
+            ]));
+        }
+
+        Cache::put($this->importCacheKey($id), [
+            'rows' => $rows,
+            'cursor' => $cursor,
             'inserted' => $inserted,
             'errors' => $errors,
-        ];
+            'seen' => $seen,
+        ], now()->addHours(2));
+
+        return view('view_accounts.import_progress', [
+            'importId' => $id,
+            'processed' => $cursor,
+            'total' => $total,
+            'inserted' => $inserted,
+            'waiting' => false,
+        ]);
     }
 
     public function store(Request $request)
