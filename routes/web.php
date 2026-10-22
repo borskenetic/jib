@@ -198,6 +198,7 @@ Route::middleware(['auth', 'can:isAdmin'])->group(function () {
 
     // User Management
     Route::get('/view-users', [UserController::class, 'index'])->name('users.index');
+    Route::get('/view-users/export', [UserController::class, 'export'])->name('users.export');
     Route::get('/view-users/import-template', [UserController::class, 'downloadImportTemplate'])->name('users.import.template');
     Route::get('/edit-user/{id}', [UserController::class, 'edit'])->name('users.edit');
     Route::put('/update-user/{id}', [UserController::class, 'update'])->name('users.update');

@@ -33,6 +33,35 @@ class UserController extends Controller
         ];
     }
 
+    public function export(Request $request): StreamedResponse
+    {
+        $filename = 'users-'.now()->format('Y-m-d').'.csv';
+        $roles = User::roleOptions();
+        $users = $this->filteredUsersQuery($request)->get();
+
+        return response()->streamDownload(function () use ($users, $roles) {
+            $out = fopen('php://output', 'w');
+            fwrite($out, "\xEF\xBB\xBF");
+            fputcsv($out, ['Last name', 'First name', 'Email', 'Role', 'Campus', 'Department', 'Course']);
+
+            foreach ($users as $user) {
+                fputcsv($out, [
+                    $user->lname,
+                    $user->fname,
+                    $user->email,
+                    $roles[$user->role] ?? ucfirst((string) $user->role),
+                    $user->campus,
+                    $user->department,
+                    $user->course,
+                ]);
+            }
+
+            fclose($out);
+        }, $filename, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+        ]);
+    }
+
     public function downloadImportTemplate(): StreamedResponse
     {
         $filename = 'user_accounts_import_template.csv';
@@ -256,7 +285,7 @@ class UserController extends Controller
         return redirect()->route('users.index')->with('success', 'User account created successfully.');
     }
 
-    public function index(Request $request)
+    private function filteredUsersQuery(Request $request)
     {
         $query = User::query();
 
@@ -280,12 +309,17 @@ class UserController extends Controller
             $query->where('role', $request->role);
         }
 
+        return $query->orderBy('lname')->orderBy('fname');
+    }
+
+    public function index(Request $request)
+    {
         $perPage = (int) $request->input('per_page', 10);
         if (! in_array($perPage, [10, 25, 50, 100], true)) {
             $perPage = 10;
         }
 
-        $users = $query->orderBy('lname')->orderBy('fname')->paginate($perPage)->withQueryString();
+        $users = $this->filteredUsersQuery($request)->paginate($perPage)->withQueryString();
 
         $courses = User::whereNotNull('course')->select('course')->distinct()->orderBy('course')->pluck('course');
 

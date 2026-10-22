@@ -8,6 +8,7 @@
     <div class="page-toolbar">
         <div class="page-toolbar-group">
             <a href="{{ route('users.create') }}" class="btn-app btn-primary-app btn-sm-app">+ Create user</a>
+            <a href="{{ route('users.export', request()->only(['search', 'role', 'course'])) }}" class="btn-app btn-outline-app btn-sm-app">Export users</a>
             <a href="{{ route('users.import.template') }}" class="btn-app btn-outline-app btn-sm-app">Download CSV template</a>
             <form action="{{ route('users.import.preview') }}" method="POST" enctype="multipart/form-data" class="inline-import-form">
                 @csrf
